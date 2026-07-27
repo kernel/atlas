@@ -8,6 +8,7 @@ package mysql
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"ariga.io/atlas/schemahcl"
@@ -103,16 +104,18 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, changes, 6)
 	})
-	t.Run("index comment change is preserved", func(t *testing.T) {
+	t.Run("index comment change preserves foreign key replacement", func(t *testing.T) {
 		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
 		to := constraintTable("", "`id` > 0", schema.Cascade, false)
 		from.Indexes[0].Attrs = append(from.Indexes[0].Attrs, &schema.Comment{Text: "before"})
 		to.Indexes[0].Attrs = append(to.Indexes[0].Attrs, &schema.Comment{Text: "after"})
 		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
 		require.NoError(t, err)
-		require.Len(t, changes, 2)
+		require.Len(t, changes, 4)
 		require.IsType(t, &schema.DropIndex{}, changes[0])
 		require.IsType(t, &schema.AddIndex{}, changes[1])
+		require.IsType(t, &schema.DropForeignKey{}, changes[2])
+		require.IsType(t, &schema.AddForeignKey{}, changes[3])
 	})
 	t.Run("real modifications", func(t *testing.T) {
 		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
@@ -166,6 +169,20 @@ func TestDiff_ConstraintNames(t *testing.T) {
 	})
 }
 
+func TestDiffConstraintNames_Compose(t *testing.T) {
+	var extension schemahcl.DefaultExtension
+	extension.Extra.Children = []*schemahcl.Resource{{
+		Type:  "constraint_names",
+		Attrs: []*schemahcl.Attr{{K: "strategy", V: cty.StringVal("ignore_all")}},
+	}}
+	opts := &schema.DiffOptions{Extra: &extension}
+	DiffConstraintNames(ConstraintNamesIgnoreVitess)(opts)
+	extra, err := mysqlDiffOptions(opts)
+	require.NoError(t, err)
+	require.Equal(t, ConstraintNamesIgnoreVitess, extra.ConstraintNames.Strategy)
+	require.Same(t, &extension, opts.Extra.(*DiffOptions).extra)
+}
+
 func TestDiff_ConstraintNamesHCL(t *testing.T) {
 	var extra schemahcl.DefaultExtension
 	extra.Extra.Children = []*schemahcl.Resource{{
@@ -181,7 +198,7 @@ func TestDiff_ConstraintNamesHCL(t *testing.T) {
 	require.Empty(t, changes)
 }
 
-func TestVitessOriginalConstraintName(t *testing.T) {
+func TestParseVitessConstraintName(t *testing.T) {
 	for _, tt := range []struct {
 		name, want string
 	}{
@@ -197,8 +214,14 @@ func TestVitessOriginalConstraintName(t *testing.T) {
 		{name: "check1_7NO794P1X6ZW6JE1GFQMT7BCA", want: "check1_7NO794P1X6ZW6JE1GFQMT7BCA"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, vitessOriginalConstraintName("children", tt.name))
+			require.Equal(t, tt.want, parseVitessConstraintName("children", tt.name).base)
 		})
+	}
+	longTable := strings.Repeat("children", 8)
+	for _, kind := range []string{"ibfk_1", "chk_1"} {
+		desired := longTable + "_" + kind
+		live := desired[:mysqlMaxConstraintNameLen-vitessConstraintSuffixLen] + vitessSuffix
+		require.True(t, vitessConstraintNamesMatch(longTable, live, desired))
 	}
 }
 

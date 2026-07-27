@@ -34,14 +34,27 @@ type DiffOptions struct {
 	ConstraintNames struct {
 		Strategy ConstraintNameStrategy `spec:"strategy"`
 	} `spec:"constraint_names"`
+	extra any
 }
 
 // DiffConstraintNames configures how MySQL constraint names are matched.
 func DiffConstraintNames(strategy ConstraintNameStrategy) schema.DiffOption {
 	return func(opts *schema.DiffOptions) {
-		extra := &DiffOptions{}
-		extra.ConstraintNames.Strategy = strategy
-		opts.Extra = extra
+		switch extra := opts.Extra.(type) {
+		case DiffOptions:
+			extra.ConstraintNames.Strategy = strategy
+			opts.Extra = extra
+		case *DiffOptions:
+			if extra == nil {
+				extra = &DiffOptions{}
+			}
+			extra.ConstraintNames.Strategy = strategy
+			opts.Extra = extra
+		default:
+			wrapped := &DiffOptions{extra: opts.Extra}
+			wrapped.ConstraintNames.Strategy = strategy
+			opts.Extra = wrapped
+		}
 	}
 }
 
@@ -75,14 +88,25 @@ func (d *diff) AnnotateTableChanges(table *schema.Table, changes []schema.Change
 }
 
 func mysqlDiffOptions(opts *schema.DiffOptions) (*DiffOptions, error) {
+	return decodeDiffOptions(opts.Extra)
+}
+
+func decodeDiffOptions(value any) (*DiffOptions, error) {
 	var extra DiffOptions
-	switch v := opts.Extra.(type) {
+	switch v := value.(type) {
 	case nil:
 	case DiffOptions:
-		extra = v
+		base, err := decodeDiffOptions(v.extra)
+		if err != nil {
+			return nil, err
+		}
+		extra = *base
+		if v.ConstraintNames.Strategy != "" {
+			extra.ConstraintNames.Strategy = v.ConstraintNames.Strategy
+		}
 	case *DiffOptions:
 		if v != nil {
-			extra = *v
+			return decodeDiffOptions(*v)
 		}
 	case schemahcl.DefaultExtension:
 		if err := v.Extra.As(&extra); err != nil {
@@ -95,13 +119,14 @@ func mysqlDiffOptions(opts *schema.DiffOptions) (*DiffOptions, error) {
 			}
 		}
 	default:
-		return nil, fmt.Errorf("mysql: unexpected DiffOptions.Extra type %T", opts.Extra)
+		return nil, fmt.Errorf("mysql: unexpected DiffOptions.Extra type %T", value)
 	}
 	return &extra, nil
 }
 
 type foreignKeyPair struct {
-	from, to *schema.ForeignKey
+	drop, add int
+	from, to  *schema.ForeignKey
 }
 
 func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy ConstraintNameStrategy) {
@@ -120,18 +145,22 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 			if !ok || usedFK[j] || !constraintNamesMatch(strategy, modify.T.Name, drop.F.Symbol, add.F.Symbol) || !d.foreignKeysEqual(drop.F, add.F) {
 				continue
 			}
-			remove[i], remove[j], usedFK[j] = true, true, true
-			pairs = append(pairs, foreignKeyPair{from: drop.F, to: add.F})
+			usedFK[j] = true
+			pairs = append(pairs, foreignKeyPair{drop: i, add: j, from: drop.F, to: add.F})
 			break
 		}
 	}
 	for _, pair := range pairs {
 		drop := findIndexChange(modify.Changes, pair.from.Symbol, true, remove)
 		add := findIndexChange(modify.Changes, pair.to.Symbol, false, remove)
-		if drop != -1 && add != -1 {
+		switch {
+		case drop == -1 && add == -1:
+			remove[pair.drop], remove[pair.add] = true, true
+		case drop != -1 && add != -1:
 			dropIndex := modify.Changes[drop].(*schema.DropIndex).I
 			addIndex := modify.Changes[add].(*schema.AddIndex).I
 			if d.indexesEqual(dropIndex, addIndex) {
+				remove[pair.drop], remove[pair.add] = true, true
 				remove[drop], remove[add] = true, true
 			}
 		}
@@ -175,37 +204,48 @@ func vitessConstraintNamesMatch(table, from, to string) bool {
 	if from == to {
 		return true
 	}
-	from, fromGenerated := parseVitessConstraintName(table, from)
-	to, toGenerated := parseVitessConstraintName(table, to)
-	if fromGenerated || toGenerated {
-		const maxPrefix = mysqlMaxConstraintNameLen - vitessConstraintSuffixLen
-		if len(from) > maxPrefix {
-			from = from[:maxPrefix]
-		}
-		if len(to) > maxPrefix {
-			to = to[:maxPrefix]
-		}
+	fromName := parseVitessConstraintName(table, from)
+	toName := parseVitessConstraintName(table, to)
+	if !fromName.generated() && !toName.generated() {
+		return false
 	}
-	return from == to
+	if fromName.base == toName.base {
+		return true
+	}
+	const maxPrefix = mysqlMaxConstraintNameLen - vitessConstraintSuffixLen
+	return truncateConstraintName(fromName.base, maxPrefix) == truncateConstraintName(toName.base, maxPrefix) ||
+		fromName.suffixed != toName.suffixed && truncateConstraintName(fromName.raw, maxPrefix) == truncateConstraintName(toName.raw, maxPrefix)
 }
 
-func vitessOriginalConstraintName(table, name string) string {
-	name, _ = parseVitessConstraintName(table, name)
-	return name
+type parsedConstraintName struct {
+	base, raw           string
+	suffixed, automatic bool
 }
 
-func parseVitessConstraintName(table, name string) (string, bool) {
-	generated := false
+func (n parsedConstraintName) generated() bool {
+	return n.suffixed || n.automatic
+}
+
+func parseVitessConstraintName(table, name string) parsedConstraintName {
+	parsed := parsedConstraintName{raw: name}
 	if match := vitessConstraintName.FindStringSubmatch(name); len(match) > 0 && match[2] != "" {
-		name, generated = match[1], true
+		parsed.raw, parsed.suffixed = match[1], true
 	}
-	if prefix := table + "_chk_"; strings.HasPrefix(name, prefix) {
-		return name[len(table)+1:], true
+	parsed.base = parsed.raw
+	if prefix := table + "_chk_"; strings.HasPrefix(parsed.base, prefix) {
+		parsed.base, parsed.automatic = parsed.base[len(table)+1:], true
 	}
-	if prefix := table + "_ibfk_"; strings.HasPrefix(name, prefix) {
-		return name[len(table)+1:], true
+	if prefix := table + "_ibfk_"; strings.HasPrefix(parsed.base, prefix) {
+		parsed.base, parsed.automatic = parsed.base[len(table)+1:], true
 	}
-	return name, generated
+	return parsed
+}
+
+func truncateConstraintName(name string, length int) string {
+	if len(name) > length {
+		return name[:length]
+	}
+	return name
 }
 
 func (d *diff) foreignKeysEqual(from, to *schema.ForeignKey) bool {
