@@ -48,6 +48,15 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []schema.Change{&schema.AddColumn{C: to.Columns[2]}}, changes)
 	})
+	t.Run("ignore vitess auto-generated names with suffix", func(t *testing.T) {
+		from := constraintTable("", "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, true)
+		renameConstraints(from, "children_ibfk_1"+vitessSuffix, "children_chk_1"+vitessSuffix)
+		renameConstraints(to, "children_ibfk_1", "children_chk_1")
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Equal(t, []schema.Change{&schema.AddColumn{C: to.Columns[2]}}, changes)
+	})
 	t.Run("ignore vitess truncated prefix", func(t *testing.T) {
 		const (
 			fkName    = "children_parent_fk_name_longer_than_thirty_eight"
@@ -93,6 +102,17 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
 		require.NoError(t, err)
 		require.Len(t, changes, 6)
+	})
+	t.Run("index comment change is preserved", func(t *testing.T) {
+		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		from.Indexes[0].Attrs = append(from.Indexes[0].Attrs, &schema.Comment{Text: "before"})
+		to.Indexes[0].Attrs = append(to.Indexes[0].Attrs, &schema.Comment{Text: "after"})
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Len(t, changes, 2)
+		require.IsType(t, &schema.DropIndex{}, changes[0])
+		require.IsType(t, &schema.AddIndex{}, changes[1])
 	})
 	t.Run("real modifications", func(t *testing.T) {
 		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
@@ -168,8 +188,10 @@ func TestVitessOriginalConstraintName(t *testing.T) {
 		{name: "check1", want: "check1"},
 		{name: "check1_7no794p1x6zw6je1gfqmt7bca", want: "check1"},
 		{name: "children_chk_1", want: "chk_1"},
+		{name: "children_chk_1_7no794p1x6zw6je1gfqmt7bca", want: "chk_1"},
 		{name: "chk_1_7no794p1x6zw6je1gfqmt7bca", want: "chk_1"},
 		{name: "children_ibfk_1", want: "ibfk_1"},
+		{name: "children_ibfk_1_7no794p1x6zw6je1gfqmt7bca", want: "ibfk_1"},
 		{name: "ibfk_1_7no794p1x6zw6je1gfqmt7bca", want: "ibfk_1"},
 		{name: "check1_7no794p1x6zw6je1gfqmt7bcas", want: "check1_7no794p1x6zw6je1gfqmt7bcas"},
 		{name: "check1_7NO794P1X6ZW6JE1GFQMT7BCA", want: "check1_7NO794P1X6ZW6JE1GFQMT7BCA"},

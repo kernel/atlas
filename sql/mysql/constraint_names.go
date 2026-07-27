@@ -195,16 +195,17 @@ func vitessOriginalConstraintName(table, name string) string {
 }
 
 func parseVitessConstraintName(table, name string) (string, bool) {
+	generated := false
+	if match := vitessConstraintName.FindStringSubmatch(name); len(match) > 0 && match[2] != "" {
+		name, generated = match[1], true
+	}
 	if prefix := table + "_chk_"; strings.HasPrefix(name, prefix) {
 		return name[len(table)+1:], true
 	}
 	if prefix := table + "_ibfk_"; strings.HasPrefix(name, prefix) {
 		return name[len(table)+1:], true
 	}
-	if match := vitessConstraintName.FindStringSubmatch(name); len(match) > 0 && match[2] != "" {
-		return match[1], true
-	}
-	return name, false
+	return name, generated
 }
 
 func (d *diff) foreignKeysEqual(from, to *schema.ForeignKey) bool {
@@ -243,7 +244,7 @@ func findIndexChange(changes []schema.Change, name string, drop bool, removed ma
 }
 
 func (d *diff) indexesEqual(from, to *schema.Index) bool {
-	if from.Unique != to.Unique || len(from.Parts) != len(to.Parts) || d.IndexAttrChanged(from.Attrs, to.Attrs) {
+	if from.Unique != to.Unique || len(from.Parts) != len(to.Parts) || d.IndexAttrChanged(from.Attrs, to.Attrs) || sqlx.CommentDiff(from.Attrs, to.Attrs) != nil {
 		return false
 	}
 	for i := range from.Parts {
