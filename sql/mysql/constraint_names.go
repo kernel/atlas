@@ -163,6 +163,14 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 				remove[pair.drop], remove[pair.add] = true, true
 				remove[drop], remove[add] = true, true
 			}
+		case (drop == -1) != (add == -1):
+			remove[pair.drop], remove[pair.add] = true, true
+			if drop != -1 {
+				remove[drop] = true
+			}
+			if add != -1 {
+				remove[add] = true
+			}
 		}
 	}
 	usedCheck := make(map[int]bool)

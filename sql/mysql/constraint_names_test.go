@@ -72,6 +72,14 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []schema.Change{&schema.AddColumn{C: to.Columns[2]}}, changes)
 	})
+	t.Run("ignore vitess with asymmetric index changes", func(t *testing.T) {
+		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		to.Indexes = nil
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Empty(t, changes)
+	})
 	t.Run("ignore all", func(t *testing.T) {
 		from := constraintTable("_old", "`id` > 0", schema.Cascade, false)
 		to := constraintTable("_new", "`id` > 0", schema.Cascade, true)
