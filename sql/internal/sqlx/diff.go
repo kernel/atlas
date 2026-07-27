@@ -101,6 +101,12 @@ type (
 		AnnotateChanges([]schema.Change, *schema.DiffOptions) ([]schema.Change, error)
 	}
 
+	// TableChangesAnnotator is an optional interface that allows DiffDriver to
+	// annotate table changes before they are returned.
+	TableChangesAnnotator interface {
+		AnnotateTableChanges(*schema.Table, []schema.Change, *schema.DiffOptions) ([]schema.Change, error)
+	}
+
 	// ChangeSupporter wraps the single SupportChange method.
 	ChangeSupporter interface {
 		// SupportChange can be implemented to tell the Differ if they support
@@ -284,6 +290,9 @@ func (d *Diff) tableDiff(from, to *schema.Table, opts *schema.DiffOptions) ([]sc
 		if _, ok := from.ForeignKey(fk1.Symbol); !ok {
 			changes = opts.AddOrSkip(changes, &schema.AddForeignKey{F: fk1})
 		}
+	}
+	if a, ok := d.DiffDriver.(TableChangesAnnotator); ok {
+		return a.AnnotateTableChanges(to, changes, opts)
 	}
 	return changes, nil
 }
