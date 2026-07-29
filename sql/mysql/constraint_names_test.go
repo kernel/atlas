@@ -49,6 +49,15 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []schema.Change{&schema.AddColumn{C: to.Columns[2]}}, changes)
 	})
+	t.Run("ignore vitess with multiple independent foreign keys", func(t *testing.T) {
+		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		addIndependentForeignKey(from, vitessSuffix)
+		addIndependentForeignKey(to, "")
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Empty(t, changes)
+	})
 	t.Run("ignore vitess auto-generated names with suffix", func(t *testing.T) {
 		from := constraintTable("", "`id` > 0", schema.Cascade, false)
 		to := constraintTable("", "`id` > 0", schema.Cascade, true)
@@ -71,6 +80,27 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
 		require.NoError(t, err)
 		require.Equal(t, []schema.Change{&schema.AddColumn{C: to.Columns[2]}}, changes)
+	})
+	t.Run("truncated explicit rename uses strict mode", func(t *testing.T) {
+		const maxPrefix = mysqlMaxConstraintNameLen - vitessConstraintSuffixLen
+		prefix := strings.Repeat("f", maxPrefix)
+		from := constraintTable("", "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		renameConstraints(from, prefix+vitessSuffix, "children_id_positive")
+		renameConstraints(to, prefix+"_renamed", "children_id_positive")
+
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Empty(t, changes, "Vitess discards characters after the prefix, so ignore_vitess cannot distinguish this rename")
+
+		changes, err = DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesStrict))
+		require.NoError(t, err)
+		require.Len(t, changes, 4, "strict mode is required for a rename that differs only after the Vitess truncation boundary")
+	})
+	t.Run("index expression wrapping is equivalent", func(t *testing.T) {
+		from := schema.NewIndex("idx").AddParts(schema.NewIndexPart().SetExpr(&schema.RawExpr{X: "(lower(parent_id))"}))
+		to := schema.NewIndex("idx").AddParts(schema.NewIndexPart().SetExpr(&schema.RawExpr{X: "lower(parent_id)"}))
+		require.True(t, sqlx.IndexEqual(differ.DiffDriver, from, to))
 	})
 	t.Run("ignore vitess with asymmetric index changes", func(t *testing.T) {
 		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
@@ -267,6 +297,20 @@ func TestParseVitessConstraintName(t *testing.T) {
 		live := desired[:mysqlMaxConstraintNameLen-vitessConstraintSuffixLen] + vitessSuffix
 		require.True(t, vitessConstraintNamesMatch(longTable, live, desired))
 	}
+}
+
+func addIndependentForeignKey(table *schema.Table, suffix string) {
+	accountID := schema.NewIntColumn("account_id", TypeBigInt)
+	table.AddColumns(accountID)
+	name := "children_account_fk" + suffix
+	table.AddIndexes(schema.NewIndex(name).AddParts(schema.NewIndexPart().SetColumn(accountID)))
+	table.AddForeignKeys(schema.NewForeignKey(name).
+		SetTable(table).
+		AddColumns(accountID).
+		SetRefTable(table.ForeignKeys[0].RefTable).
+		AddRefColumns(table.ForeignKeys[0].RefColumns[0]).
+		SetOnUpdate(schema.NoAction).
+		SetOnDelete(schema.Cascade))
 }
 
 func renameConstraints(table *schema.Table, foreignKey, check string) {

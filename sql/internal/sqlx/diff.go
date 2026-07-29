@@ -431,6 +431,11 @@ func (d *Diff) indexDiffT(from, to *schema.Table, opts *schema.DiffOptions) ([]s
 	return changes, nil
 }
 
+// IndexEqual reports whether two indexes have the same definition according to the driver.
+func IndexEqual(driver DiffDriver, from, to *schema.Index) bool {
+	return (&Diff{DiffDriver: driver}).indexChange(from, to) == schema.NoChange
+}
+
 // indexChange returns the schema changes (if any) for migrating one index to the other.
 func (d *Diff) indexChange(from, to *schema.Index) schema.ChangeKind {
 	var change schema.ChangeKind

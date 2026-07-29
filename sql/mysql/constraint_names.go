@@ -6,7 +6,6 @@ package mysql
 
 import (
 	"fmt"
-	"reflect"
 	"regexp"
 	"strings"
 
@@ -59,11 +58,14 @@ func DiffConstraintNames(strategy ConstraintNameStrategy) schema.DiffOption {
 }
 
 const (
+	// MySQL limits constraint identifiers to 64 bytes.
 	mysqlMaxConstraintNameLen = 64
-	vitessConstraintSuffixLen = 26
+	// Vitess appends "_" and a 25-character base-36 hash to constraint names.
+	vitessConstraintHashLen   = 25
+	vitessConstraintSuffixLen = 1 + vitessConstraintHashLen
 )
 
-var vitessConstraintName = regexp.MustCompile(`^(.*?)(_([0-9a-z]{25}))?$`)
+var vitessConstraintName = regexp.MustCompile(fmt.Sprintf(`^(.*?)(_(?:[0-9a-z]{%d}))?$`, vitessConstraintHashLen))
 
 // AnnotateTableChanges implements sqlx.TableChangesAnnotator.
 func (d *diff) AnnotateTableChanges(table *schema.Table, changes []schema.Change, opts *schema.DiffOptions) ([]schema.Change, error) {
@@ -124,33 +126,34 @@ func decodeDiffOptions(value any) (*DiffOptions, error) {
 	return &extra, nil
 }
 
-type foreignKeyPair struct {
+type constraintChangePair[T any] struct {
 	drop, add int
-	from, to  *schema.ForeignKey
+	from, to  T
 }
 
 func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy ConstraintNameStrategy) {
-	var (
-		remove = make(map[int]bool)
-		usedFK = make(map[int]bool)
-		pairs  []foreignKeyPair
-	)
-	for i, change := range modify.Changes {
-		drop, ok := change.(*schema.DropForeignKey)
-		if !ok {
-			continue
-		}
-		for j, candidate := range modify.Changes {
-			add, ok := candidate.(*schema.AddForeignKey)
-			if !ok || usedFK[j] || !constraintNamesMatch(strategy, modify.T.Name, drop.F.Symbol, add.F.Symbol) || !d.foreignKeysEqual(drop.F, add.F) {
-				continue
+	remove := make(map[int]bool)
+	foreignKeys := pairConstraintChanges(
+		modify.Changes,
+		func(change schema.Change) (*schema.ForeignKey, bool) {
+			drop, ok := change.(*schema.DropForeignKey)
+			if !ok {
+				return nil, false
 			}
-			usedFK[j] = true
-			pairs = append(pairs, foreignKeyPair{drop: i, add: j, from: drop.F, to: add.F})
-			break
-		}
-	}
-	for _, pair := range pairs {
+			return drop.F, true
+		},
+		func(change schema.Change) (*schema.ForeignKey, bool) {
+			add, ok := change.(*schema.AddForeignKey)
+			if !ok {
+				return nil, false
+			}
+			return add.F, true
+		},
+		func(from, to *schema.ForeignKey) bool {
+			return constraintNamesMatch(strategy, modify.T.Name, from.Symbol, to.Symbol) && d.foreignKeysEqual(from, to)
+		},
+	)
+	for _, pair := range foreignKeys {
 		drop := findIndexChange(modify.Changes, pair.from.Symbol, true, remove)
 		add := findIndexChange(modify.Changes, pair.to.Symbol, false, remove)
 		switch {
@@ -159,7 +162,7 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 		case drop != -1 && add != -1:
 			dropIndex := modify.Changes[drop].(*schema.DropIndex).I
 			addIndex := modify.Changes[add].(*schema.AddIndex).I
-			if d.indexesEqual(dropIndex, addIndex) {
+			if sqlx.IndexEqual(d, dropIndex, addIndex) {
 				remove[pair.drop], remove[pair.add] = true, true
 				remove[drop], remove[add] = true, true
 			}
@@ -175,20 +178,28 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 			}
 		}
 	}
-	usedCheck := make(map[int]bool)
-	for i, change := range modify.Changes {
-		drop, ok := change.(*schema.DropCheck)
-		if !ok {
-			continue
-		}
-		for j, candidate := range modify.Changes {
-			add, ok := candidate.(*schema.AddCheck)
-			if !ok || usedCheck[j] || !constraintNamesMatch(strategy, modify.T.Name, drop.C.Name, add.C.Name) || !checksEqual(drop.C, add.C) {
-				continue
+	checks := pairConstraintChanges(
+		modify.Changes,
+		func(change schema.Change) (*schema.Check, bool) {
+			drop, ok := change.(*schema.DropCheck)
+			if !ok {
+				return nil, false
 			}
-			remove[i], remove[j], usedCheck[j] = true, true, true
-			break
-		}
+			return drop.C, true
+		},
+		func(change schema.Change) (*schema.Check, bool) {
+			add, ok := change.(*schema.AddCheck)
+			if !ok {
+				return nil, false
+			}
+			return add.C, true
+		},
+		func(from, to *schema.Check) bool {
+			return constraintNamesMatch(strategy, modify.T.Name, from.Name, to.Name) && checksEqual(from, to)
+		},
+	)
+	for _, pair := range checks {
+		remove[pair.drop], remove[pair.add] = true, true
 	}
 	filtered := modify.Changes[:0]
 	for i, change := range modify.Changes {
@@ -197,6 +208,33 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 		}
 	}
 	modify.Changes = filtered
+}
+
+func pairConstraintChanges[T any](
+	changes []schema.Change,
+	dropConstraint, addConstraint func(schema.Change) (T, bool),
+	equal func(T, T) bool,
+) []constraintChangePair[T] {
+	var (
+		pairs   []constraintChangePair[T]
+		usedAdd = make(map[int]bool)
+	)
+	for i, change := range changes {
+		from, ok := dropConstraint(change)
+		if !ok {
+			continue
+		}
+		for j, candidate := range changes {
+			to, ok := addConstraint(candidate)
+			if !ok || usedAdd[j] || !equal(from, to) {
+				continue
+			}
+			usedAdd[j] = true
+			pairs = append(pairs, constraintChangePair[T]{drop: i, add: j, from: from, to: to})
+			break
+		}
+	}
+	return pairs
 }
 
 func constraintNamesMatch(strategy ConstraintNameStrategy, table, from, to string) bool {
@@ -222,6 +260,10 @@ func vitessConstraintNamesMatch(table, from, to string) bool {
 	if fromName.base == toName.base {
 		return true
 	}
+	// Vitess truncates the original name to leave room for "_" and its
+	// 25-character hash within MySQL's 64-byte identifier limit. Because the
+	// discarded characters cannot be recovered, callers must use strict mode
+	// for a rename that differs only after this boundary.
 	const maxPrefix = mysqlMaxConstraintNameLen - vitessConstraintSuffixLen
 	return truncateConstraintName(fromName.base, maxPrefix) == truncateConstraintName(toName.base, maxPrefix) ||
 		fromName.suffixed != toName.suffixed && truncateConstraintName(fromName.raw, maxPrefix) == truncateConstraintName(toName.raw, maxPrefix)
@@ -310,29 +352,4 @@ func findIndexChange(changes []schema.Change, name string, drop bool, removed ma
 		}
 	}
 	return -1
-}
-
-func (d *diff) indexesEqual(from, to *schema.Index) bool {
-	if from.Unique != to.Unique || len(from.Parts) != len(to.Parts) || d.IndexAttrChanged(from.Attrs, to.Attrs) || sqlx.CommentDiff(from.Attrs, to.Attrs) != nil {
-		return false
-	}
-	for i := range from.Parts {
-		f, t := from.Parts[i], to.Parts[i]
-		if f.Desc != t.Desc || d.IndexPartAttrChanged(from, to, i) {
-			return false
-		}
-		switch {
-		case f.C != nil && t.C != nil:
-			if f.C.Name != t.C.Name {
-				return false
-			}
-		case f.X != nil && t.X != nil:
-			if !reflect.DeepEqual(f.X, t.X) {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
 }
