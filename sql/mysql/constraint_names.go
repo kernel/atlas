@@ -164,12 +164,14 @@ func (d *diff) filterConstraintNameChanges(modify *schema.ModifyTable, strategy 
 				remove[drop], remove[add] = true, true
 			}
 		case (drop == -1) != (add == -1):
-			remove[pair.drop], remove[pair.add] = true, true
-			if drop != -1 {
+			// A one-sided AddIndex is a genuine declared change, hence it is kept
+			// along with the foreign-key pair. A one-sided DropIndex is redundant
+			// only if no other index on the desired table covers the foreign-key
+			// columns as a prefix, i.e., applying the desired state from scratch
+			// would recreate an equivalent implicit index.
+			if add == -1 && !indexCoversForeignKey(modify.T, pair.to) {
+				remove[pair.drop], remove[pair.add] = true, true
 				remove[drop] = true
-			}
-			if add != -1 {
-				remove[add] = true
 			}
 		}
 	}
@@ -273,6 +275,25 @@ func (d *diff) foreignKeysEqual(from, to *schema.ForeignKey) bool {
 func checksEqual(from, to *schema.Check) bool {
 	return enforced(from.Attrs) == enforced(to.Attrs) &&
 		(from.Expr == to.Expr || sqlx.MayWrap(from.Expr) == sqlx.MayWrap(to.Expr))
+}
+
+// indexCoversForeignKey reports if the table has an index that covers the
+// foreign-key columns as a prefix, meaning MySQL would not create an implicit
+// index to support the constraint.
+func indexCoversForeignKey(t *schema.Table, fk *schema.ForeignKey) bool {
+search:
+	for _, idx := range t.Indexes {
+		if len(idx.Parts) < len(fk.Columns) {
+			continue
+		}
+		for i, c := range fk.Columns {
+			if idx.Parts[i].C == nil || idx.Parts[i].C.Name != c.Name {
+				continue search
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func findIndexChange(changes []schema.Change, name string, drop bool, removed map[int]bool) int {

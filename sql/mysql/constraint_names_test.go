@@ -80,6 +80,42 @@ func TestDiff_ConstraintNames(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, changes)
 	})
+	t.Run("ignore vitess with asymmetric added index", func(t *testing.T) {
+		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
+		from.Indexes[0].Name = "idx_p"
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Len(t, changes, 4)
+		require.Equal(t, "idx_p", changes[0].(*schema.DropIndex).I.Name)
+		require.Equal(t, "children_parent_fk", changes[1].(*schema.AddIndex).I.Name)
+		require.Equal(t, "children_parent_fk"+vitessSuffix, changes[2].(*schema.DropForeignKey).F.Symbol)
+		require.Equal(t, "children_parent_fk", changes[3].(*schema.AddForeignKey).F.Symbol)
+		plan, err := DefaultPlan.PlanChanges(context.Background(), "constraint names", []schema.Change{
+			&schema.ModifyTable{T: from, Changes: changes},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		require.Contains(t, plan.Changes[0].Cmd, "ADD INDEX `children_parent_fk`")
+	})
+	t.Run("ignore vitess with asymmetric dropped index covered by desired", func(t *testing.T) {
+		from := constraintTable(vitessSuffix, "`id` > 0", schema.Cascade, false)
+		to := constraintTable("", "`id` > 0", schema.Cascade, false)
+		to.Indexes[0].Name = "idx_p"
+		changes, err := DefaultDiff.TableDiff(from, to, schema.DiffNormalized(), DiffConstraintNames(ConstraintNamesIgnoreVitess))
+		require.NoError(t, err)
+		require.Len(t, changes, 4)
+		require.Equal(t, "children_parent_fk"+vitessSuffix, changes[0].(*schema.DropIndex).I.Name)
+		require.Equal(t, "idx_p", changes[1].(*schema.AddIndex).I.Name)
+		require.Equal(t, "children_parent_fk"+vitessSuffix, changes[2].(*schema.DropForeignKey).F.Symbol)
+		require.Equal(t, "children_parent_fk", changes[3].(*schema.AddForeignKey).F.Symbol)
+		plan, err := DefaultPlan.PlanChanges(context.Background(), "constraint names", []schema.Change{
+			&schema.ModifyTable{T: from, Changes: changes},
+		})
+		require.NoError(t, err)
+		require.Len(t, plan.Changes, 1)
+		require.Contains(t, plan.Changes[0].Cmd, "DROP INDEX `children_parent_fk"+vitessSuffix+"`")
+	})
 	t.Run("ignore all", func(t *testing.T) {
 		from := constraintTable("_old", "`id` > 0", schema.Cascade, false)
 		to := constraintTable("_new", "`id` > 0", schema.Cascade, true)
